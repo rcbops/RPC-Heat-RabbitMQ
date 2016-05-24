@@ -1,0 +1,7 @@
+[
+  {kernel,
+        [{inet_dist_listen_min, {{ salt['pillar.get']('rabbitmq:inet_dist_listen_min', 58000) }}},
+        {inet_dist_listen_max, {{ salt['pillar.get']('rabbitmq:inet_dist_listen_max', 62000) }}}
+        ]
+  }
+].
