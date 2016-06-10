@@ -265,10 +265,10 @@ resources:
     type: OS::Heat::SoftwareDeployment
     properties:
       input_values:
-        master:
+        public_key:
           get_attr:
-             - haproxy
-             - first_address
+            - coms
+            - public_key
         git_formula_repo:
           get_param: git-formula-repo
       config:

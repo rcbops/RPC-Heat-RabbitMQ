@@ -1,20 +1,20 @@
 minion-4gb:
-  - james-rabbitmq-haproxy-1:
+  - rabbitmq-haproxy-1:
       grains:
         roles:
           - rabbitmq-haproxy
 
-  - james-rabbitmq-node-1:
+  - rabbitmq-node-1:
       grains:
         roles:
           - rabbitmq
 
-  - james-rabbitmq-node-2:
+  - rabbitmq-node-2:
       grains:
         roles:
           - rabbitmq
 
-  - james-rabbitmq-node-3:
+  - rabbitmq-node-3:
       grains:
         roles:
           - rabbitmq
