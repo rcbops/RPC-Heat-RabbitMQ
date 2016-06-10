@@ -1,0 +1,20 @@
+minion-4gb:
+  - rabbitmq-haproxy-1:
+      grains:
+        roles:
+          - rabbitmq-haproxy
+
+  - rabbitmq-node-1:
+      grains:
+        roles:
+          - rabbitmq
+
+  - rabbitmq-node-2:
+      grains:
+        roles:
+          - rabbitmq
+
+  - rabbitmq-node-3:
+      grains:
+        roles:
+          - rabbitmq

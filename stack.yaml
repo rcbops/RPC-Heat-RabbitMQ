@@ -1,0 +1,572 @@
+heat_template_version: 2015-04-30
+
+description: |
+  Deploys a variable number of node rabbitmq cluster.
+  Deploys one haproxy node.
+  The haproxy node will also run salt-master.
+
+parameter_groups:
+  - label: Sizing and location
+    description: What networks and how large of a vm.
+    parameters:
+      - keyname
+      - image
+      - flavor
+      - apps-network
+      - node-count
+
+  - label: Don't touch
+    description: These parameters should be left default except in special cases.
+    parameters:
+      - git-formula-repo
+
+parameters:
+
+  keyname:
+    type: string
+    label: SSH Keypair name.
+    description: Name of the ssh key used to ssh into mysql server.
+
+  image:
+    type: string
+    label: Image Name
+    description: Name of the trusty image that contains software config heat elements.
+
+  flavor:
+    type: string
+    label: Flavor
+    description: Flavor (size) for all virtual machines in this stack.
+    default: m1.small
+
+  apps-network:
+    type: string
+    label: Apps Network Name or UUID
+    description: Existing private network that is routable to a public network.
+    default: changeme
+
+  node-count:
+    type: number
+    default: 3
+    label: Number of RabbitMQ Servers.
+    description: Number of RabbitMQ Servers.
+    constraints:
+      - range:
+          min: 3
+          max: 7
+
+  git-formula-repo:
+    type: string
+    label: RabbitMq Formula Repo
+    description: Formula git repository. This should remain as default except for development.
+    default: https://github.com/rcbops/RPC-Heat-Rabbitmq.git
+
+resources:
+
+  erlang-cookie:
+    type: OS::Heat::RandomString
+    properties:
+      length: 32
+      sequence: uppercase
+
+  rabbitmq-secret:
+    type: OS::Heat::RandomString
+    properties:
+      length: 32
+      sequence: lettersdigits
+
+  # Security group
+  secgroup:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        str_replace:
+          template: rabbitmq-$stack_name$
+          params:
+            $stack_name$:
+              get_param: OS::stack_name
+      rules:
+        # SSH
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        # Salt
+        - protocol: tcp
+          port_range_min: 4505
+          port_range_max: 4506
+        # epmd
+        - protocol: tcp
+          port_range_min: 4369
+          port_range_max: 4369
+        # erlang_distribution
+        - protocol: tcp
+          port_range_min: 25672
+          port_range_max: 25672
+        # aqmp
+        - protocol: tcp
+          port_range_min: 5672
+          port_range_max: 5672
+        # aqmp_tls
+        - protocol: tcp
+          port_range_min: 5671
+          port_range_max: 5671
+        # management_plugin
+        - protocol: tcp
+          port_range_min: 15672
+          port_range_max: 15672
+        # stomp
+        - protocol: tcp
+          port_range_min: 61613
+          port_range_max: 61613
+        # stomp_other
+        - protocol: tcp
+          port_range_min: 61614
+          port_range_max: 61614
+        # mqtt
+        - protocol: tcp
+          port_range_min: 1883
+          port_range_max: 1883
+        # mqtt_other
+        - protocol: tcp
+          port_range_min: 8883
+          port_range_max: 8883
+        # inet_dist_listen
+        - protocol: tcp
+          port_range_min: 60000
+          port_range_max: 60010
+        # http
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+
+
+  # Keypair for communicating between nodes within the stack.
+  # Will allow minions to ssh into the master and vice versa.
+  coms:
+    type: OS::Nova::KeyPair
+    properties:
+      save_private_key: true
+      name:
+        str_replace:
+          template: rabbitmq-key-$stack_name$
+          params:
+            $stack_name$:
+              get_param: OS::stack_name
+
+  # One port for the haproxy/salt-master node
+  haproxy-port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        str_replace:
+          template: rabbitmq-haproxy-port-$stack_name$
+          params:
+            $stack_name$:
+              get_param: OS::stack_name
+      network_id:
+        get_param: apps-network
+      security_groups:
+        - get_resource: secgroup
+
+  # Software configuration script for the salt-master
+  config-salt-master:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      inputs:
+        - name: public_key
+        - name: git_formula_repo
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-salt-master
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+
+        [ -e ${prefix}.ran ] && exit 0
+        chmod -R 0600 ${logdir}
+        chmod 0700 /root/.ssh/coms_rsa
+        chmod 0600 /srv/pillar/rabbitmq.sls
+
+        # Add coms from minions to master
+        echo "$public_key" >> /root/.ssh/authorized_keys
+
+        # Install salt-master and git
+        echo "Install Salt Master"
+        add-apt-repository -y ppa:saltstack/salt2015-5
+        apt-get update
+        apt-get install -y --force-yes git salt-master
+
+        mkdir -p /srv/salt
+        echo -e 'file_roots:\n  base:\n    - /srv/salt' >> /etc/salt/master
+
+        git clone "${git_formula_repo}" /srv/salt/rabbitmq
+
+        # Finally - Restart salt service
+        service salt-master restart
+
+  # Software configuration for the salt minion.
+  # Installs salt minion and connects minion to master.
+  config-salt-minion:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      inputs:
+        - name: public_key
+        - name: master
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-salt-minion
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+        [ -e ${prefix}.ran ] && exit 0
+
+        chmod -R 0600 ${logdir}
+        chmod 0700 /root/.ssh/coms_rsa
+
+        # Add coms from minions to master
+        echo "$public_key" >> /root/.ssh/authorized_keys
+
+        # Install salt minion
+        add-apt-repository -y ppa:saltstack/salt2015-5
+        apt-get update
+        apt-get install -y --force-yes git salt-minion
+
+        echo master: $master >> /etc/salt/minion
+        service salt-minion restart
+
+        ssh-keyscan -H $master >> /root/.ssh/known_hosts
+
+        MASTER_PKI_PATH="/etc/salt/pki/master/minions/"
+        MASTER_PKI_PATH_PRE="/etc/salt/pki/master/minions_pre/"
+        MINION_PKI_PATH="/etc/salt/pki/minion/minion.pub"
+        HOSTNAME="$(python  -c 'import socket; print socket.getfqdn()')"
+
+        while [ ! -s ${MINION_PKI_PATH} ]; do
+            echo "Waiting for ${MINION_PKI_PATH} to have non-zero content."
+            sleep 2
+        done
+
+        cp $MINION_PKI_PATH /root/minion_key
+        scp -i /root/.ssh/coms_rsa /root/minion_key root@$master:/tmp/$HOSTNAME
+        ssh -i /root/.ssh/coms_rsa root@$master "mv /tmp/$HOSTNAME $MASTER_PKI_PATH$HOSTNAME; chmod 700 $MASTER_PKI_PATH$HOSTNAME"
+        rm /root/minion_key
+        if [ ! -f /etc/salt/master ]; then
+            rm /root/.ssh/coms_rsa
+        fi
+        service salt-minion restart
+        touch ${prefix}.ran
+
+  # Software deployment for salt-master. Deploys the salt-master software
+  # configuration.
+  deploy-salt-master:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      input_values:
+        public_key:
+          get_attr:
+            - coms
+            - public_key
+        git_formula_repo:
+          get_param: git-formula-repo
+      config:
+        get_resource: config-salt-master
+      server:
+        get_resource: haproxy
+
+  # The salt master instance
+  # Should have one floating ip
+  haproxy:
+    type: OS::Nova::Server
+    properties:
+      key_name:
+        get_param: keyname
+      image:
+        get_param: image
+      flavor:
+        get_param: flavor
+      name:
+        str_replace:
+          template: rabbitmq-haproxy-$stack_name$
+          params:
+            $stack_name$:
+              get_param: OS::stack_name
+
+      personality:
+        # Private key for ssh'ing into minions
+        /root/.ssh/coms_rsa:
+          get_attr:
+            - coms
+            - private_key
+
+        # The top.sls file for salt pillars.
+        # Dictates which minions get which pillars
+        /srv/pillar/top.sls: |
+          base:
+            'roles:rabbitmq':
+              - match: grain
+              - rabbitmq
+            'roles:rabbitmq-haproxy':
+              - match: grain
+              - rabbitmq
+
+        # The top.sls file for salt states.
+        # Dictates which minions get which states.
+        /srv/salt/top.sls: |
+          base:
+            'roles:rabbitmq':
+              - match: grain
+              - rabbitmq.rabbitmq
+            'roles:rabbitmq-haproxy':
+              - match: grain
+              - rabbitmq.haproxy
+
+        # Set the salt grain for roles
+        /etc/salt/grains: |
+          roles:
+            - rabbitmq-haproxy
+
+        # The app pillar. Describe interfaces and salt-mine functions.
+        /srv/pillar/rabbitmq.sls:
+          str_replace:
+            params:
+              $erlan-_cookie$:
+                get_attr:
+                  - erlang-cookie
+                  - value
+              $rabbitmq-secret$:
+                get_attr:
+                  - rabbitmq-secret
+                  - value
+            template: |
+              rabbitmq:
+                # version: "3.5.3-1"
+                plugin:
+                  rabbitmq_management:
+                    - enabled
+                policy:
+                  rabbitmq_policy:
+                    - name: HA
+                    - pattern: '.*'
+                    - definition: '{"ha-mode": "all"}'
+                vhost:
+                  virtual_host:
+                    - owner: rabbit_user
+                    - conf: .*
+                    - write: .*
+                    - read: .*
+                user:
+                  rabbit:
+                    - password: $rabbitmq-secret$
+                    - force: True
+                    - tags: monitoring, user
+                    - perms:
+                      - '/':
+                        - '.*'
+                        - '.*'
+                        - '.*'
+                    - runas: root
+
+                cookie: $erlang-cookie$
+                inet_dist_listen_min: 60000
+                inet_dist_listen_max: 60010
+
+              mine_functions:
+                internal_ips:
+                  mine_function: network.ipaddrs
+                  interface: eth0
+                external_ips:
+                  mine_function: network.ipaddrs
+                  interface: eth0
+                id:
+                  - mine_function: grains.get
+                  - id
+                host:
+                  - mine_function: grains.get
+                  - host
+
+              user-ports:
+                ssh:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 22
+                salt-master:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 4505
+                salt-minion:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 4506
+                epmd:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 4369
+                erlang_distribution:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 25672
+                aqmp:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 5672
+                aqmp_tls:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 5671
+                management_plugin:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 15672
+                stomp:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 61613
+                stomp_other:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 61614
+                mqtt:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 1883
+                mqtt_other:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 8883
+                inet_dist_listen:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 60000:60010
+                http:
+                  chain: INPUT
+                  proto: tcp
+                  dport: 80
+
+      # Get access from the master-port
+      networks:
+        - port:
+            get_resource: haproxy-port
+
+      # Using SoftwareConfigs - This needs to be set to SOFTWARE_CONFIG
+      user_data_format: SOFTWARE_CONFIG
+
+  # Deploys the salt-minion software config to the haproxy node.
+  deploy-salt-minion-haproxy:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: deploy-salt-master
+    properties:
+      input_values:
+        public_key:
+          get_attr:
+            - coms
+            - public_key
+        master:
+          get_attr:
+            - haproxy
+            - first_address
+      config:
+        get_resource: config-salt-minion
+      server:
+        get_resource: haproxy
+
+  rabbitmq-servers:
+    type: OS::Heat::ResourceGroup
+    depends_on: deploy-salt-master
+    properties:
+      count:
+        get_param: node-count
+      resource_def:
+        type: Salt::RabbitMQMinion
+        properties:
+          flavor:
+            get_param: flavor
+          stack-prefix:
+            str_replace:
+              template: rabbitmq-node-$stack_name$
+              params:
+                $stack_name$:
+                  get_param: OS::stack_name
+          private_key:
+            get_attr:
+              - coms
+              - private_key
+          public_key:
+            get_attr:
+              - coms
+              - public_key
+          image:
+            get_param: image
+          network:
+            get_param: apps-network
+          master:
+            get_attr:
+              - haproxy
+              - first_address
+          minion-config:
+            get_resource: config-salt-minion
+          minion-roles: "rabbitmq"
+          security-group:
+            get_resource: secgroup
+
+  config-deploy:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-deploy
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+        [ -e ${prefix}.ran ] && exit 0
+        salt-run state.orchestrate rabbitmq.runner
+        sleep 90
+        salt '*' test.ping
+        salt '*' state.sls rabbitmq.test
+        touch ${prefix}.ran
+
+  deploy:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config:
+        get_resource: config-deploy
+      server:
+        get_resource: haproxy
+    depends_on:
+      - deploy-salt-master
+      - deploy-salt-minion-haproxy
+      - rabbitmq-servers
+
+outputs:
+  haproxy-ip:
+    description: The ip address of the haproxy/salt-master server.
+    value:
+      get_attr:
+        - haproxy
+        - first_address
+
+  amqp-port:
+    description: The AMQP Port.
+    value: 5672
+
+  rabbitmq_server_ips:
+    description: IP addresses of the rabbitmq servers.
+    value:
+      get_attr:
+        - rabbitmq-servers
+        - minion-ip
+
+  ssh_access:
+    description: How to ssh into the stack.
+    value:
+      str_replace:
+        template: ssh ubuntu@$haproxy-ip$
+        params:
+          $haproxy-ip$:
+            get_attr:
+              - haproxy
+              - first_address
